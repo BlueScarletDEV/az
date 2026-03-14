@@ -48,11 +48,50 @@ def show_in_taskbar():
     except: pass
 
 def get_key_state(vk):
-    try:    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+    """
+    GetKeyState retourne l'état PHYSIQUE du bouton (pas les injections SendInput).
+    C'est crucial pour le clic gauche : on veut détecter le vrai appui humain,
+    pas le clic simulé par pynput lui-même (qui passe par SendInput et pollue
+    GetAsyncKeyState mais PAS GetKeyState).
+    """
+    try:    return bool(ctypes.windll.user32.GetKeyState(vk) & 0x8000)
     except: return False
 
 VK_LBUTTON = 0x01
 VK_RBUTTON = 0x02
+
+# SendInput direct — contourne pynput pour éviter les effets de bord
+INPUT_MOUSE    = 0
+MOUSEEVENTF_LEFTDOWN   = 0x0002
+MOUSEEVENTF_LEFTUP     = 0x0004
+MOUSEEVENTF_RIGHTDOWN  = 0x0008
+MOUSEEVENTF_RIGHTUP    = 0x0010
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx",ctypes.c_long),("dy",ctypes.c_long),
+                ("mouseData",ctypes.c_ulong),("dwFlags",ctypes.c_ulong),
+                ("time",ctypes.c_ulong),("dwExtraInfo",ctypes.POINTER(ctypes.c_ulong))]
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT)]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type",ctypes.c_ulong),("_input",INPUT_UNION)]
+
+def _send_mouse(flags):
+    try:
+        inp = INPUT(type=INPUT_MOUSE,
+                    _input=INPUT_UNION(mi=MOUSEINPUT(0,0,0,flags,0,None)))
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+    except: pass
+
+def click_down(button):
+    if button == Button.left:  _send_mouse(MOUSEEVENTF_LEFTDOWN)
+    else:                       _send_mouse(MOUSEEVENTF_RIGHTDOWN)
+
+def click_up(button):
+    if button == Button.left:  _send_mouse(MOUSEEVENTF_LEFTUP)
+    else:                       _send_mouse(MOUSEEVENTF_RIGHTUP)
 
 # ═══════════════════════════════════════════════════════════
 #  PALETTE
@@ -156,7 +195,11 @@ class ClickerSide:
         now = time.perf_counter()
         return sum(1 for t in self._log if now-t < 1.0)
 
-    def tick(self, mouse):
+    def tick(self):
+        """
+        GetKeyState (pas GetAsync) = état physique uniquement,
+        ignore les clics injectés par SendInput.
+        """
         if not self.enabled:
             self.cur_delay = 0; return
         if not get_key_state(self.vk):
@@ -164,31 +207,32 @@ class ClickerSide:
         now = time.perf_counter()
         if now < self._next: return
         cps   = random.uniform(self.min_cps, max(self.min_cps, self.max_cps))
-        delay = 1.0/cps + random.uniform(-self.offset/2000, self.offset/2000)
-        delay = max(0.008, delay)
+        delay = 1.0 / cps + random.uniform(-self.offset/2000, self.offset/2000)
+        delay = max(0.015, delay)
         self.cur_delay = delay * 1000
         self._next = now + delay
         if self.inv:
-            mouse.release(self.button); time.sleep(0.008); mouse.press(self.button)
+            click_up(self.button);   time.sleep(0.008); click_down(self.button)
         else:
-            mouse.press(self.button);   time.sleep(0.008); mouse.release(self.button)
+            click_down(self.button); time.sleep(0.008); click_up(self.button)
         self._log.append(time.perf_counter())
+
 
 class Engine:
     def __init__(self):
-        self.mouse     = MouseCtrl()
         self.left      = ClickerSide(Button.left,  VK_LBUTTON, Key.f6)
         self.right     = ClickerSide(Button.right, VK_RBUTTON, Key.f8)
         self.hide_bind = Key.f7
         self._stop     = threading.Event()
 
     def start(self):
-        threading.Thread(target=self._loop, daemon=True).start()
+        # thread séparé par side : l'un ne bloque plus l'autre
+        threading.Thread(target=self._loop, args=(self.left,),  daemon=True).start()
+        threading.Thread(target=self._loop, args=(self.right,), daemon=True).start()
 
-    def _loop(self):
+    def _loop(self, side):
         while not self._stop.is_set():
-            self.left.tick(self.mouse)
-            self.right.tick(self.mouse)
+            side.tick()
             time.sleep(0.001)
 
     def stop(self): self._stop.set()
