@@ -1,649 +1,557 @@
 """
-Radon Clicker - Python/pygame
-Reconstruction propre basée sur l'analyse de Radon (Runtime_Broker.exe)
-Fonctionnalités : Left Clicker, CPS min/max, offset delay, average CPS,
-                  inv-click, toggle, bind customisable, click sounds, UI dark
-Zéro réseau. Zéro collecte. 100% local.
-Dépendances : pip install pygame pynput
+Radon Clicker — v3.0
+Left Clicker + Right Clicker séparés
+Hide bind : cache fenêtre + taskbar, clicker continue en fond
+Bind customisable : clavier + touches souris
+pip install pygame pynput
 """
 
 import pygame
-import time
-import random
-import threading
-import math
-import os
-import sys
+import time, random, threading, math, sys, os, ctypes
 from collections import deque
-from pynput.mouse import Button, Controller as MouseController
-from pynput.keyboard import Key, KeyCode, Listener as KeyListener
+from pynput.mouse    import Button, Controller as MouseCtrl
+from pynput.keyboard import Key, KeyCode, Listener as KbListener
 
-# ─────────────────────────────────────────────────────────────
-#  CONSTANTS & THEME (Radon dark palette)
-# ─────────────────────────────────────────────────────────────
-W, H = 340, 490
+# ═══════════════════════════════════════════════════════════
+#  WIN32 helpers — hide from taskbar sans fermer
+# ═══════════════════════════════════════════════════════════
+GWL_EXSTYLE      = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW  = 0x00040000
 
-C = {
-    "bg":        (15,  15,  20),
-    "panel":     (22,  22,  30),
-    "border":    (45,  45,  60),
-    "accent":    (100, 140, 255),
-    "accent2":   (70,  110, 220),
-    "on":        (80,  200, 120),
-    "off":       (200, 70,  70),
-    "text":      (220, 220, 235),
-    "subtext":   (130, 130, 150),
-    "handle":    (100, 140, 255),
-    "track_bg":  (35,  35,  48),
-    "shadow":    (0,   0,   0,  120),
-    "hover":     (35,  35,  50),
-    "white":     (255, 255, 255),
-    "overlay":   (10,  10,  15,  200),
-}
+def _hwnd():
+    try:
+        info = pygame.display.get_wm_info()
+        return info.get("window") or info.get("hwnd") or 0
+    except:
+        return 0
 
-# ─────────────────────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────────────────────
-def lerp_color(a, b, t):
-    return tuple(int(a[i] + (b[i]-a[i])*t) for i in range(3))
+def hide_from_taskbar():
+    hwnd = _hwnd()
+    if not hwnd: return
+    try:
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except: pass
 
-def draw_rounded_rect(surf, color, rect, r, alpha=255):
+def show_in_taskbar():
+    hwnd = _hwnd()
+    if not hwnd: return
+    try:
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        ctypes.windll.user32.ShowWindow(hwnd, 9)
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+    except: pass
+
+def get_key_state(vk):
+    try:    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+    except: return False
+
+VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
+
+# ═══════════════════════════════════════════════════════════
+#  PALETTE
+# ═══════════════════════════════════════════════════════════
+W, H = 380, 580
+
+BG       = (11,  11,  16 )
+PANEL    = (18,  18,  26 )
+PANEL2   = (24,  24,  34 )
+BORDER   = (40,  40,  58 )
+ACCENT_L = (82,  130, 255)
+ACCENT_R = (255, 100, 100)
+TEXT     = (225, 225, 240)
+SUBTEXT  = (110, 110, 140)
+ON       = (72,  200, 110)
+WHITE    = (255, 255, 255)
+
+def lerp(a, b, t):
+    t = max(0.0, min(1.0, t))
+    return tuple(int(a[i]+(b[i]-a[i])*t) for i in range(len(a)))
+
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+
+# ═══════════════════════════════════════════════════════════
+#  FONTS
+# ═══════════════════════════════════════════════════════════
+pygame.init()
+_fonts = {}
+def font(size, bold=False):
+    k = (size, bold)
+    if k not in _fonts:
+        try:    _fonts[k] = pygame.font.SysFont("Consolas", size, bold=bold)
+        except: _fonts[k] = pygame.font.Font(None, size+4)
+    return _fonts[k]
+
+# ═══════════════════════════════════════════════════════════
+#  DRAW UTILS
+# ═══════════════════════════════════════════════════════════
+def rrect(surf, col, rect, r=6, width=0):
+    pygame.draw.rect(surf, col, rect, border_radius=r, width=width)
+
+def rrect_a(surf, col, rect, r=6, alpha=255, width=0):
     s = pygame.Surface((rect[2], rect[3]), pygame.SRCALPHA)
-    pygame.draw.rect(s, (*color[:3], alpha), (0, 0, rect[2], rect[3]), border_radius=r)
+    pygame.draw.rect(s, (*col[:3], alpha), (0,0,rect[2],rect[3]), border_radius=r, width=width)
     surf.blit(s, (rect[0], rect[1]))
 
-def draw_border_rect(surf, color, rect, r, width=1):
-    pygame.draw.rect(surf, color, rect, width=width, border_radius=r)
+def txt(surf, text, fnt, col, x, y, anchor="topleft"):
+    s = fnt.render(str(text), True, col)
+    r = s.get_rect(**{anchor:(x,y)})
+    surf.blit(s, r)
+    return s.get_width()
 
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+# ═══════════════════════════════════════════════════════════
+#  KEY NAME
+# ═══════════════════════════════════════════════════════════
+def key_name(k):
+    if k is None:         return "—"
+    if k == "mouse3":     return "M3"
+    if k == "mouse4":     return "M4"
+    if k == "mouse5":     return "M5"
+    if isinstance(k, KeyCode):
+        return (k.char or "?").upper()
+    if isinstance(k, Key):
+        names = {
+            Key.f1:"F1",Key.f2:"F2",Key.f3:"F3",Key.f4:"F4",
+            Key.f5:"F5",Key.f6:"F6",Key.f7:"F7",Key.f8:"F8",
+            Key.f9:"F9",Key.f10:"F10",Key.f11:"F11",Key.f12:"F12",
+            Key.shift:"SHIFT",Key.shift_r:"SHIFT",
+            Key.ctrl_l:"CTRL",Key.ctrl_r:"CTRL",
+            Key.alt_l:"ALT",Key.alt_r:"ALT",
+            Key.caps_lock:"CAPS",Key.tab:"TAB",Key.esc:"ESC",
+            Key.space:"SPACE",Key.enter:"ENTER",Key.backspace:"BKSP",
+            Key.delete:"DEL",Key.insert:"INS",Key.home:"HOME",
+            Key.end:"END",Key.page_up:"PGUP",Key.page_down:"PGDN",
+            Key.up:"UP",Key.down:"DOWN",Key.left:"LEFT",Key.right:"RIGHT",
+            Key.num_lock:"NUMLOCK",Key.scroll_lock:"SCRLOCK",
+            Key.print_screen:"PRTSC",Key.pause:"PAUSE",
+        }
+        return names.get(k, str(k).replace("Key.","").upper())
+    return str(k)
 
-# ─────────────────────────────────────────────────────────────
-#  FONTS (loaded once)
-# ─────────────────────────────────────────────────────────────
-pygame.init()
-try:
-    FONT_TITLE  = pygame.font.SysFont("Consolas", 15, bold=True)
-    FONT_LABEL  = pygame.font.SysFont("Consolas", 12)
-    FONT_SMALL  = pygame.font.SysFont("Consolas", 11)
-    FONT_BIG    = pygame.font.SysFont("Consolas", 26, bold=True)
-    FONT_MED    = pygame.font.SysFont("Consolas", 18, bold=True)
-except:
-    FONT_TITLE  = pygame.font.Font(None, 16)
-    FONT_LABEL  = pygame.font.Font(None, 13)
-    FONT_SMALL  = pygame.font.Font(None, 12)
-    FONT_BIG    = pygame.font.Font(None, 28)
-    FONT_MED    = pygame.font.Font(None, 20)
-
-# ─────────────────────────────────────────────────────────────
-#  UI COMPONENTS
-# ─────────────────────────────────────────────────────────────
-class SkeetSlider:
-    """Slider style Radon avec label valeur + suffix"""
-    def __init__(self, x, y, w, h, min_v, max_v, value, label, suffix="", is_float=True):
-        self.rect   = pygame.Rect(x, y, w, h)
-        self.min_v  = min_v
-        self.max_v  = max_v
-        self.value  = value
-        self.label  = label
-        self.suffix = suffix
-        self.is_float = is_float
-        self.dragging = False
-        self._hover   = False
-        self._anim    = 0.0
+# ═══════════════════════════════════════════════════════════
+#  CLICKER SIDE
+# ═══════════════════════════════════════════════════════════
+class ClickerSide:
+    def __init__(self, button, vk, default_bind):
+        self.button  = button
+        self.vk      = vk
+        self.enabled = False
+        self.inv     = False
+        self.min_cps = 8.0
+        self.max_cps = 12.0
+        self.offset  = 0
+        self.bind    = default_bind
+        self._log    = deque(maxlen=80)
+        self.cur_delay = 0.0
+        self._next   = 0.0
 
     @property
-    def norm(self):
-        return (self.value - self.min_v) / (self.max_v - self.min_v)
+    def avg_cps(self):
+        now = time.perf_counter()
+        return sum(1 for t in self._log if now-t < 1.0)
 
-    def handle_event(self, event):
-        mx, my = pygame.mouse.get_pos()
-        self._hover = self.rect.collidepoint(mx, my)
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.rect.collidepoint(event.pos):
-                self.dragging = True
-        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            self.dragging = False
-        if event.type == pygame.MOUSEMOTION and self.dragging:
-            t = clamp((event.pos[0] - self.rect.x) / self.rect.w, 0, 1)
-            raw = self.min_v + t * (self.max_v - self.min_v)
-            self.value = raw if self.is_float else int(round(raw))
+    def tick(self, mouse):
+        if not self.enabled:
+            self.cur_delay = 0; return
+        if not get_key_state(self.vk):
+            self.cur_delay = 0; return
+        now = time.perf_counter()
+        if now < self._next: return
+        cps   = random.uniform(self.min_cps, max(self.min_cps, self.max_cps))
+        delay = 1.0/cps + random.uniform(-self.offset/2000, self.offset/2000)
+        delay = max(0.008, delay)
+        self.cur_delay = delay * 1000
+        self._next = now + delay
+        if self.inv:
+            mouse.release(self.button); time.sleep(0.008); mouse.press(self.button)
+        else:
+            mouse.press(self.button);   time.sleep(0.008); mouse.release(self.button)
+        self._log.append(time.perf_counter())
+
+class Engine:
+    def __init__(self):
+        self.mouse     = MouseCtrl()
+        self.left      = ClickerSide(Button.left,  VK_LBUTTON, Key.f6)
+        self.right     = ClickerSide(Button.right, VK_RBUTTON, Key.f8)
+        self.hide_bind = Key.f7
+        self._stop     = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self.left.tick(self.mouse)
+            self.right.tick(self.mouse)
+            time.sleep(0.001)
+
+    def stop(self): self._stop.set()
+
+# ═══════════════════════════════════════════════════════════
+#  WIDGETS
+# ═══════════════════════════════════════════════════════════
+class Slider:
+    def __init__(self, x, y, w, label, lo, hi, val, suffix="", is_int=False):
+        self.r      = pygame.Rect(x, y, w, 26)
+        self.label  = label; self.lo = lo; self.hi = hi
+        self.value  = val;   self.suffix = suffix; self.is_int = is_int
+        self._drag  = False; self._hover = False; self._anim = 0.0
+
+    @property
+    def norm(self): return (self.value-self.lo)/(self.hi-self.lo)
+
+    def event(self, e):
+        mx,my = pygame.mouse.get_pos()
+        self._hover = self.r.collidepoint(mx,my)
+        if e.type==pygame.MOUSEBUTTONDOWN and e.button==1 and self.r.collidepoint(e.pos): self._drag=True
+        if e.type==pygame.MOUSEBUTTONUP   and e.button==1: self._drag=False
+        if e.type==pygame.MOUSEMOTION and self._drag:
+            t = clamp((e.pos[0]-self.r.x)/self.r.w, 0, 1)
+            v = self.lo + t*(self.hi-self.lo)
+            self.value = int(round(v)) if self.is_int else round(v,1)
 
     def update(self, dt):
-        target = 1.0 if (self._hover or self.dragging) else 0.0
-        self._anim += (target - self._anim) * min(1, dt * 10)
+        tgt = 1.0 if (self._hover or self._drag) else 0.0
+        self._anim += (tgt-self._anim)*min(1,dt*14)
 
-    def draw(self, surf):
-        x, y, w, h = self.rect
-        track_h = 4
-        ty = y + h//2 - track_h//2
-
-        # track background
-        draw_rounded_rect(surf, C["track_bg"], (x, ty, w, track_h), 2)
-
-        # track fill
-        fw = int(w * self.norm)
-        if fw > 0:
-            col = lerp_color(C["accent2"], C["accent"], self._anim)
-            draw_rounded_rect(surf, col, (x, ty, fw, track_h), 2)
-
-        # handle
-        hx = x + int(w * self.norm)
-        hr = int(7 + self._anim * 2)
-        hcol = lerp_color(C["accent2"], C["accent"], self._anim)
-        pygame.draw.circle(surf, C["bg"], (hx, ty + track_h//2), hr + 2)
-        pygame.draw.circle(surf, hcol,   (hx, ty + track_h//2), hr)
-
-        # label (left) + value (right)
-        lbl  = FONT_SMALL.render(self.label, True, C["subtext"])
-        surf.blit(lbl, (x, y))
-        val_str = (f"{self.value:.1f}" if self.is_float else str(int(self.value))) + self.suffix
-        val_surf = FONT_SMALL.render(val_str, True, C["text"])
-        surf.blit(val_surf, (x + w - val_surf.get_width(), y))
+    def draw(self, surf, accent):
+        x,y,w,h = self.r
+        TH = 3; ty = y+h-6
+        rrect(surf, PANEL2, (x,ty,w,TH), 2)
+        fw = int(w*self.norm)
+        if fw>0:
+            rrect(surf, lerp(lerp(accent,(30,30,50),0.5), accent, self._anim), (x,ty,fw,TH), 2)
+        hx = x+fw
+        hr = int(5+self._anim*2)
+        pygame.draw.circle(surf, BG,   (hx, ty+TH//2), hr+2)
+        pygame.draw.circle(surf, lerp(lerp(accent,(50,50,80),0.5), accent, self._anim), (hx, ty+TH//2), hr)
+        txt(surf, self.label, font(11), SUBTEXT, x, y)
+        val_s = (str(int(self.value)) if self.is_int else f"{self.value:.1f}") + self.suffix
+        txt(surf, val_s, font(11), TEXT, x+w, y, anchor="topright")
 
 
-class SkeetCheckbox:
-    """Toggle checkbox style Radon"""
-    def __init__(self, x, y, label, value=False):
-        self.rect  = pygame.Rect(x, y, 16, 16)
-        self.label = label
-        self.value = value
-        self._anim = 1.0 if value else 0.0
+class Toggle:
+    def __init__(self, x, y, label, val=False):
+        self.r=pygame.Rect(x,y,34,16); self.label=label; self.value=val; self._anim=float(val)
 
-    def handle_event(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            lbl_w = FONT_LABEL.size(self.label)[0]
-            hit = pygame.Rect(self.rect.x, self.rect.y, 16 + 6 + lbl_w, 16)
-            if hit.collidepoint(event.pos):
+    def event(self, e):
+        if e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
+            lw = font(11).size(self.label)[0]
+            if pygame.Rect(self.r.x, self.r.y, self.r.w+8+lw, self.r.h).collidepoint(e.pos):
                 self.value = not self.value
 
     def update(self, dt):
-        target = 1.0 if self.value else 0.0
-        self._anim += (target - self._anim) * min(1, dt * 12)
+        self._anim += ((1.0 if self.value else 0.0)-self._anim)*min(1,dt*14)
 
-    def draw(self, surf):
-        x, y = self.rect.x, self.rect.y
-        col = lerp_color(C["border"], C["accent"], self._anim)
-        draw_rounded_rect(surf, col, (x, y, 16, 16), 4)
-        draw_border_rect(surf, lerp_color(C["border"], C["accent"], self._anim), (x, y, 16, 16), 4)
-        if self._anim > 0.05:
-            # checkmark
-            a = self._anim
-            p1 = (x+3, y+8)
-            p2 = (x+7, y+12)
-            p3 = (x+13, y+4)
-            alpha_col = (*C["white"], int(255*a))
-            s = pygame.Surface((16,16), pygame.SRCALPHA)
-            pygame.draw.lines(s, (255,255,255,int(255*a)), False, [(3,8),(7,12),(13,4)], 2)
-            surf.blit(s, (x, y))
-        lbl = FONT_LABEL.render(self.label, True,
-                                lerp_color(C["subtext"], C["text"], self._anim))
-        surf.blit(lbl, (x + 22, y + 1))
+    def draw(self, surf, accent):
+        x,y,w,h = self.r
+        rrect(surf, lerp(BORDER, accent, self._anim), (x,y,w,h), 8)
+        cx = int(x+h//2 + self._anim*(w-h))
+        pygame.draw.circle(surf, BG,    (cx,y+h//2), h//2)
+        pygame.draw.circle(surf, WHITE, (cx,y+h//2), h//2-2)
+        txt(surf, self.label, font(11), lerp(SUBTEXT,TEXT,self._anim), x+w+8, y+1)
 
 
-class SkeetButton:
-    """Bouton gradient style Radon"""
-    def __init__(self, x, y, w, h, label, color=None, text_color=None):
-        self.rect  = pygame.Rect(x, y, w, h)
-        self.label = label
-        self.color = color or C["accent"]
-        self.tcol  = text_color or C["white"]
-        self._hover = False
-        self._press = False
-        self._anim  = 0.0
-        self.clicked = False
+class BtnSmall:
+    def __init__(self, x, y, w, h, label):
+        self.r=pygame.Rect(x,y,w,h); self.label=label
+        self._hover=False; self._press=False; self.clicked=False; self._anim=0.0
 
-    def handle_event(self, event):
-        self.clicked = False
-        mx, my = pygame.mouse.get_pos()
-        self._hover = self.rect.collidepoint(mx, my)
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.rect.collidepoint(event.pos):
-                self._press = True
-        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            if self._press and self.rect.collidepoint(event.pos):
-                self.clicked = True
-            self._press = False
+    def event(self, e):
+        self.clicked=False
+        self._hover=self.r.collidepoint(pygame.mouse.get_pos())
+        if e.type==pygame.MOUSEBUTTONDOWN and e.button==1 and self.r.collidepoint(e.pos): self._press=True
+        if e.type==pygame.MOUSEBUTTONUP   and e.button==1:
+            if self._press and self.r.collidepoint(e.pos): self.clicked=True
+            self._press=False
 
     def update(self, dt):
-        target = 1.0 if (self._hover or self._press) else 0.0
-        self._anim += (target - self._anim) * min(1, dt * 12)
+        tgt=1.0 if (self._hover or self._press) else 0.0
+        self._anim+=(tgt-self._anim)*min(1,dt*14)
+
+    def draw(self, surf, accent):
+        x,y,w,h=self.r
+        rrect(surf, lerp(PANEL2, lerp(accent,(15,15,25),0.55), self._anim), (x,y,w,h), 5)
+        rrect(surf, lerp(BORDER, accent, self._anim), (x,y,w,h), 5, width=1)
+        txt(surf, self.label, font(11), lerp(SUBTEXT,TEXT,self._anim), x+w//2, y+h//2, anchor="center")
+
+# ═══════════════════════════════════════════════════════════
+#  SIDE PANEL
+# ═══════════════════════════════════════════════════════════
+PH = 238   # panel height
+
+class SidePanel:
+    def __init__(self, x, y, w, side, accent, title):
+        self.x=x; self.y=y; self.w=w; self.side=side; self.accent=accent; self.title=title
+        SW=w-24
+        self.sl_min = Slider(x+12, y+46,  SW, "Min CPS", 1,  30, side.min_cps, " cps")
+        self.sl_max = Slider(x+12, y+80,  SW, "Max CPS", 1,  30, side.max_cps, " cps")
+        self.sl_off = Slider(x+12, y+114, SW, "Offset",  0,  50, 0, " ms", is_int=True)
+        self.tg_en  = Toggle(x+12, y+148, "Enable",    side.enabled)
+        self.tg_inv = Toggle(x+12, y+168, "Inv-Click", side.inv)
+        self.btn    = BtnSmall(x+12, y+196, SW, 22, f"Bind: {key_name(side.bind)}")
+        self._pulse = 0.0
+
+    def events(self, e):
+        for w in [self.sl_min,self.sl_max,self.sl_off,self.tg_en,self.tg_inv,self.btn]:
+            w.event(e)
+
+    def update(self, dt):
+        for w in [self.sl_min,self.sl_max,self.sl_off,self.tg_en,self.tg_inv,self.btn]:
+            w.update(dt)
+        self.side.min_cps = self.sl_min.value
+        self.side.max_cps = max(self.sl_min.value, self.sl_max.value)
+        self.side.offset  = self.sl_off.value
+        self.side.enabled = self.tg_en.value
+        self.side.inv     = self.tg_inv.value
+        self._pulse += dt*(5 if self.side.enabled else 1.2)
 
     def draw(self, surf):
-        x, y, w, h = self.rect
-        base = lerp_color(C["panel"], self.color, 0.4 + self._anim*0.3)
-        draw_rounded_rect(surf, base, (x, y, w, h), 6)
-        draw_border_rect(surf, lerp_color(C["border"], self.color, self._anim),
-                         (x, y, w, h), 6, 1)
-        lbl = FONT_LABEL.render(self.label, True, self.tcol)
-        surf.blit(lbl, (x + w//2 - lbl.get_width()//2, y + h//2 - lbl.get_height()//2))
+        x,y,w = self.x,self.y,self.w
+        # card
+        rrect(surf, PANEL,  (x,y,w,PH), 8)
+        rrect(surf, BORDER, (x,y,w,PH), 8, width=1)
+        # top accent strip
+        rrect_a(surf, lerp(self.accent,(8,8,14),0.72), (x,y,w,34), 8, alpha=255)
+        rrect(surf,   lerp(self.accent,(8,8,14),0.72), (x,y+26,w,8), 0)
+        # pulse dot
+        dr = int(4+1.5*math.sin(self._pulse))
+        dc = ON if self.side.enabled else lerp(BORDER,ACCENT_R,0.6)
+        pygame.draw.circle(surf, dc, (x+13,y+16), dr)
+        # title
+        txt(surf, self.title, font(12,bold=True), WHITE, x+24, y+8)
+        # avg cps
+        avg = str(self.side.avg_cps)
+        txt(surf, avg+" cps", font(10), lerp(SUBTEXT,self.accent,0.9 if self.side.enabled else 0.2), x+w-10, y+10, anchor="topright")
+        # widgets
+        for wid in [self.sl_min,self.sl_max,self.sl_off]:
+            wid.draw(surf, self.accent)
+        self.tg_en.draw(surf,  self.accent)
+        self.tg_inv.draw(surf, self.accent)
+        self.btn.draw(surf, self.accent)
 
-
-# ─────────────────────────────────────────────────────────────
-#  BIND OVERLAY — waiting for a key press
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  BIND OVERLAY
+# ═══════════════════════════════════════════════════════════
 class BindOverlay:
-    def __init__(self):
-        self.active = False
-        self.target = None  # "click" | "hide"
+    def __init__(self): self.active=False; self.target=None; self.cb=None
 
-    def open(self, target):
-        self.active = True
-        self.target = target
+    def open(self, target, cb):
+        self.active=True; self.target=target; self.cb=cb
 
-    def close(self):
-        self.active = False
-        self.target = None
+    def close(self): self.active=False; self.target=None; self.cb=None
 
     def draw(self, surf):
-        if not self.active:
-            return
-        overlay = pygame.Surface((W, H), pygame.SRCALPHA)
-        overlay.fill((10, 10, 15, 210))
-        surf.blit(overlay, (0, 0))
-        t1 = FONT_MED.render("Press a key…", True, C["text"])
-        t2 = FONT_SMALL.render("Esc to cancel", True, C["subtext"])
-        surf.blit(t1, (W//2 - t1.get_width()//2, H//2 - 20))
-        surf.blit(t2, (W//2 - t2.get_width()//2, H//2 + 10))
+        if not self.active: return
+        rrect_a(surf, (6,6,12), (0,0,W,H), 0, alpha=215)
+        bx,by,bw,bh = W//2-140, H//2-55, 280, 110
+        rrect(surf, PANEL2, (bx,by,bw,bh), 10)
+        rrect(surf, BORDER, (bx,by,bw,bh), 10, width=1)
+        labels = {"left_click":"Left Click Bind","right_click":"Right Click Bind","hide":"Hide Bind"}
+        txt(surf, labels.get(self.target,"Bind"), font(13,bold=True), WHITE,   W//2, by+16,  anchor="center")
+        txt(surf, "Appuie sur une touche…",        font(11),          TEXT,    W//2, by+38,  anchor="center")
+        txt(surf, "M3 / M4 / M5 acceptés  •  Esc = annuler", font(10), SUBTEXT, W//2, by+58, anchor="center")
 
-
-# ─────────────────────────────────────────────────────────────
-#  CLICKER ENGINE
-# ─────────────────────────────────────────────────────────────
-class ClickerEngine:
+# ═══════════════════════════════════════════════════════════
+#  APP
+# ═══════════════════════════════════════════════════════════
+class App:
     def __init__(self):
-        self.mouse     = MouseController()
-        self.enabled   = False
-        self.inv_click = False
-        self.min_cps   = 8.0
-        self.max_cps   = 12.0
-        self.offset    = 0
-        self.click_bind  = Key.f6          # bind hotkey
-        self.hide_bind   = Key.f7
-        self.sound_path  = None
-        self.sound_obj   = None
-        self._thread   = None
-        self._stop     = threading.Event()
-        self._lock     = threading.Lock()
-        self._cps_log  = deque(maxlen=60)  # timestamps for avg CPS
-        self.current_delay = 0.0           # ms displayed
-        self.click_sound_enabled = False
-
-    def start(self):
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-
-    @property
-    def average_cps(self):
-        now = time.perf_counter()
-        recent = [t for t in self._cps_log if now - t < 1.0]
-        return len(recent)
-
-    def _click(self):
-        if self.inv_click:
-            self.mouse.release(Button.left)
-            time.sleep(0.01)
-            self.mouse.press(Button.left)
-        else:
-            self.mouse.press(Button.left)
-            time.sleep(0.01)
-            self.mouse.release(Button.left)
-        self._cps_log.append(time.perf_counter())
-        if self.click_sound_enabled and self.sound_obj:
-            try:
-                self.sound_obj.play()
-            except:
-                pass
-
-    def _loop(self):
-        from pynput.mouse import Button as Btn
-        import ctypes
-        while not self._stop.is_set():
-            if self.enabled:
-                # Check left mouse button held (GetAsyncKeyState style)
-                try:
-                    state = ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000
-                except:
-                    state = 0
-                if state:
-                    cps = random.uniform(self.min_cps, self.max_cps)
-                    base_delay = 1.0 / cps
-                    # offset jitter (delay offset slider)
-                    jitter = random.uniform(-self.offset/1000, self.offset/1000)
-                    delay = max(0.01, base_delay + jitter)
-                    self.current_delay = delay * 1000
-                    self._click()
-                    time.sleep(delay)
-                else:
-                    self.current_delay = 0
-                    time.sleep(0.005)
-            else:
-                self.current_delay = 0
-                time.sleep(0.02)
-
-    def load_sound(self, path):
-        try:
-            self.sound_obj  = pygame.mixer.Sound(path)
-            self.sound_path = path
-            return True
-        except:
-            return False
-
-
-# ─────────────────────────────────────────────────────────────
-#  MAIN APP
-# ─────────────────────────────────────────────────────────────
-class RadonApp:
-    def __init__(self):
-        self.screen = pygame.display.set_mode((W, H), pygame.NOFRAME)
+        self.screen = pygame.display.set_mode((W,H), pygame.NOFRAME)
         pygame.display.set_caption("Radon")
         pygame.mixer.init()
         self.clock  = pygame.time.Clock()
 
-        self.engine = ClickerEngine()
+        self.engine  = Engine()
         self.engine.start()
+        self.hidden  = False
+        self.overlay = BindOverlay()
+        self._waiting_bind = False
+        self._drag_win = False
+        self._drag_off = (0,0)
+        self._win_pos  = [100,100]
+        self._status   = ""
+        self._status_t = 0.0
 
-        # UI state
-        self.dragging_window = False
-        self.drag_offset     = (0, 0)
-        self.bind_overlay    = BindOverlay()
-        self.waiting_bind    = None   # "click" | "hide"
-        self.status_msg      = ""
-        self.status_timer    = 0.0
-        self.hidden          = False
+        PAD = 10
+        PW  = (W - PAD*3) // 2
+        PY  = 56
+        self.panel_l = SidePanel(PAD,       PY, PW, self.engine.left,  ACCENT_L, "Left Click")
+        self.panel_r = SidePanel(PAD*2+PW,  PY, PW, self.engine.right, ACCENT_R, "Right Click")
+        self.btn_hide = BtnSmall(PAD, PY+PH+8, W-PAD*2, 24,
+                                  f"Hide Bind: {key_name(self.engine.hide_bind)}")
 
-        # ── Sliders ──────────────────────────────────────────
-        SX, SW = 24, W - 48
-        self.sl_min = SkeetSlider(SX, 130, SW, 22, 1.0, 30.0, 8.0,  "Min CPS",    " cps", is_float=True)
-        self.sl_max = SkeetSlider(SX, 168, SW, 22, 1.0, 30.0, 12.0, "Max CPS",    " cps", is_float=True)
-        self.sl_off = SkeetSlider(SX, 206, SW, 22, 0,   50,   0,    "Delay Offset"," ms", is_float=False)
-        self.sliders = [self.sl_min, self.sl_max, self.sl_off]
+        self._kb = KbListener(on_press=self._on_key)
+        self._kb.start()
+        from pynput.mouse import Listener as ML
+        self._ml = ML(on_click=self._on_mouse_extra)
+        self._ml.start()
 
-        # ── Checkboxes ────────────────────────────────────────
-        self.cb_toggle = SkeetCheckbox(SX, 260, "Enable Clicker", value=False)
-        self.cb_inv    = SkeetCheckbox(SX, 284, "Inv-Click (release → press)", value=False)
-        self.cb_sound  = SkeetCheckbox(SX, 308, "Click Sounds", value=False)
-        self.checkboxes = [self.cb_toggle, self.cb_inv, self.cb_sound]
-
-        # ── Buttons ───────────────────────────────────────────
-        BW = (SW - 8) // 2
-        self.btn_bind_click = SkeetButton(SX,           342, BW, 26, "Click Bind: F6")
-        self.btn_bind_hide  = SkeetButton(SX + BW + 8, 342, BW, 26, "Hide Bind: F7")
-        self.btn_load_sound = SkeetButton(SX,           376, SW, 26, "Load Click Sound…",
-                                          color=C["track_bg"])
-        self.buttons = [self.btn_bind_click, self.btn_bind_hide, self.btn_load_sound]
-
-        # ── Keyboard listener ─────────────────────────────────
-        self._key_listener = KeyListener(on_press=self._on_key)
-        self._key_listener.start()
-
-        # pulse anim for CPS dot
-        self._pulse = 0.0
-        self._pulse_dir = 1
-
-    # ──────────────────────────────────────────────────────────
-    #  KEY LISTENER (global hotkeys)
-    # ──────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────
     def _on_key(self, key):
-        if self.waiting_bind:
-            # ESC cancels
+        if self._waiting_bind:
             if key == Key.esc:
-                self.waiting_bind = None
-                self.bind_overlay.close()
-                return
-            # assign bind
-            if self.waiting_bind == "click":
-                self.engine.click_bind = key
-                name = getattr(key, 'char', None) or str(key).replace('Key.','').upper()
-                self.btn_bind_click.label = f"Click Bind: {name}"
-            else:
-                self.engine.hide_bind = key
-                name = getattr(key, 'char', None) or str(key).replace('Key.','').upper()
-                self.btn_bind_hide.label = f"Hide Bind: {name}"
-            self.waiting_bind = None
-            self.bind_overlay.close()
-            return
-
-        if key == self.engine.click_bind:
-            self.engine.enabled = not self.engine.enabled
-            self.cb_toggle.value = self.engine.enabled
-
+                self.overlay.close(); self._waiting_bind=False; return
+            if self.overlay.cb: self.overlay.cb(key)
+            self.overlay.close(); self._waiting_bind=False; return
         if key == self.engine.hide_bind:
-            self.hidden = not self.hidden
+            if self.hidden: self._show()
+            else:           self._hide()
+            return
+        if key == self.engine.left.bind:
+            self.engine.left.enabled  = not self.engine.left.enabled
+            self.panel_l.tg_en.value  = self.engine.left.enabled
+        if key == self.engine.right.bind:
+            self.engine.right.enabled = not self.engine.right.enabled
+            self.panel_r.tg_en.value  = self.engine.right.enabled
 
-    # ──────────────────────────────────────────────────────────
-    #  SYNC engine ← UI
-    # ──────────────────────────────────────────────────────────
-    def _sync(self):
-        self.engine.min_cps   = self.sl_min.value
-        self.engine.max_cps   = max(self.sl_min.value, self.sl_max.value)
-        self.engine.offset    = self.sl_off.value
-        self.engine.enabled   = self.cb_toggle.value
-        self.engine.inv_click = self.cb_inv.value
-        self.engine.click_sound_enabled = self.cb_sound.value
+    def _on_mouse_extra(self, x, y, button, pressed):
+        if not pressed: return
+        extra = {Button.middle:"mouse3", Button.x1:"mouse4", Button.x2:"mouse5"}
+        bname = extra.get(button)
+        if not bname or not self._waiting_bind: return
+        if self.overlay.cb: self.overlay.cb(bname)
+        self.overlay.close(); self._waiting_bind=False
 
-    # ──────────────────────────────────────────────────────────
-    #  DRAW HELPERS
-    # ──────────────────────────────────────────────────────────
-    def _draw_bg(self):
-        self.screen.fill(C["bg"])
-        # top accent bar
-        draw_rounded_rect(self.screen, C["panel"], (0, 0, W, H), 10)
-        draw_border_rect(self.screen, C["border"], (0, 0, W, H), 10, 1)
+    def _hide(self):
+        self.hidden=True; hide_from_taskbar()
 
-    def _draw_header(self):
-        # gradient title bar
-        bar = pygame.Surface((W, 52), pygame.SRCALPHA)
-        for i in range(52):
-            t = i / 52
-            col = lerp_color(C["accent2"], C["panel"], t)
-            pygame.draw.line(bar, col, (0, i), (W, i))
-        self.screen.blit(bar, (0, 0))
-        draw_border_rect(self.screen, C["border"], (0, 0, W, H), 10, 1)
+    def _show(self):
+        self.hidden=False; show_in_taskbar()
 
-        # title
-        t = FONT_TITLE.render("RADON", True, C["white"])
-        self.screen.blit(t, (16, 14))
-        sub = FONT_SMALL.render("Left Clicker  •  v2.0", True, (180,180,200))
-        self.screen.blit(sub, (16, 32))
+    def _set_bind(self, side_str, k):
+        if side_str=="left":
+            self.engine.left.bind=k; self.panel_l.btn.label=f"Bind: {key_name(k)}"
+            self._status=f"Left bind → {key_name(k)}"
+        elif side_str=="right":
+            self.engine.right.bind=k; self.panel_r.btn.label=f"Bind: {key_name(k)}"
+            self._status=f"Right bind → {key_name(k)}"
+        else:
+            self.engine.hide_bind=k; self.btn_hide.label=f"Hide Bind: {key_name(k)}"
+            self._status=f"Hide bind → {key_name(k)}"
+        self._status_t=2.5
 
-        # close button
-        pygame.draw.circle(self.screen, (200,60,60), (W-20, 18), 8)
-        cl = FONT_SMALL.render("×", True, C["white"])
-        self.screen.blit(cl, (W-20 - cl.get_width()//2, 18 - cl.get_height()//2))
+    # ───────────────────────────────────────────────────────
+    def _draw(self, dt):
+        s = self.screen
+        s.fill(BG)
 
-    def _draw_cps_panel(self, dt):
-        # panel
-        px, py, pw, ph = 24, 62, W-48, 56
-        draw_rounded_rect(self.screen, C["track_bg"], (px, py, pw, ph), 8)
-        draw_border_rect(self.screen, C["border"], (px, py, pw, ph), 8, 1)
+        # ── Header gradient ──────────────────────────────────
+        for i in range(50):
+            t = i/50
+            c = lerp(lerp(ACCENT_L,ACCENT_R,0.5), PANEL, t**0.5)
+            pygame.draw.line(s, c, (1,i),(W-2,i))
 
-        avg = self.engine.average_cps
-        cur_delay = self.engine.current_delay
-        active = self.engine.enabled
+        rrect(s, BORDER, (0,0,W,H), 10, width=1)
 
-        # pulse dot
-        self._pulse += dt * (4 if active else 1)
-        dot_r = int(5 + 2 * math.sin(self._pulse))
-        dot_col = C["on"] if active else C["off"]
-        pygame.draw.circle(self.screen, dot_col, (px+15, py+ph//2), dot_r)
+        txt(s, "RADON",            font(15,bold=True), WHITE,   16, 10)
+        txt(s, "left & right clicker", font(9),        (170,170,195), 16,28)
 
-        # avg CPS big number
-        cps_str = f"{avg}"
-        big = FONT_BIG.render(cps_str, True, C["white"] if active else C["subtext"])
-        self.screen.blit(big, (px + 36, py + 6))
-        unit = FONT_SMALL.render("avg cps", True, C["subtext"])
-        self.screen.blit(unit, (px + 36, py + 36))
+        total = self.engine.left.avg_cps + self.engine.right.avg_cps
+        txt(s, f"{total} cps", font(10), lerp(SUBTEXT,WHITE,0.5), W-14, 20, anchor="topright")
 
-        # current delay
-        delay_str = f"{cur_delay:.1f} ms" if cur_delay else "—"
-        dl = FONT_SMALL.render(f"delay: {delay_str}", True, C["subtext"])
-        self.screen.blit(dl, (px + pw - dl.get_width() - 10, py + 10))
+        # close
+        cr = pygame.Rect(W-26,8,18,18)
+        hov = cr.collidepoint(pygame.mouse.get_pos())
+        pygame.draw.circle(s, (210,55,55) if hov else (130,35,35), (W-17,17), 8)
+        txt(s, "×", font(13,bold=True), WHITE, W-17,17, anchor="center")
 
-        # status
-        state_str = "ACTIVE" if active else "IDLE"
-        sc = C["on"] if active else C["subtext"]
-        sl = FONT_SMALL.render(state_str, True, sc)
-        self.screen.blit(sl, (px + pw - sl.get_width() - 10, py + 30))
+        pygame.draw.line(s, BORDER, (0,50),(W,50), 1)
 
-    def _draw_section(self, label, y):
-        lbl = FONT_SMALL.render(label.upper(), True, C["subtext"])
-        self.screen.blit(lbl, (24, y))
-        pygame.draw.line(self.screen, C["border"],
-                         (24 + lbl.get_width() + 6, y + 5),
-                         (W - 24, y + 5), 1)
+        # ── Panels + hide btn ────────────────────────────────
+        self.panel_l.draw(s)
+        self.panel_r.draw(s)
+        self.btn_hide.draw(s, lerp(ACCENT_L,ACCENT_R,0.5))
 
-    def _draw_status(self):
-        if self.status_timer > 0:
-            alpha = min(255, int(self.status_timer * 510))
-            s = FONT_SMALL.render(self.status_msg, True, C["on"])
-            s.set_alpha(alpha)
-            self.screen.blit(s, (W//2 - s.get_width()//2, H - 22))
+        # ── Footer ───────────────────────────────────────────
+        txt(s, "zero network  •  100% local", font(9), lerp(BORDER,SUBTEXT,0.4), W//2, H-12, anchor="center")
 
-    def _draw_footer(self):
-        f = FONT_SMALL.render("Zero network  •  100% local", True, C["border"])
-        self.screen.blit(f, (W//2 - f.get_width()//2, H - 18))
+        # ── Status ───────────────────────────────────────────
+        if self._status_t>0:
+            a = min(255, int(self._status_t*350))
+            ss = font(10).render(self._status, True, ON)
+            ss.set_alpha(a)
+            s.blit(ss, (W//2-ss.get_width()//2, H-26))
 
-    # ──────────────────────────────────────────────────────────
-    #  MAIN LOOP
-    # ──────────────────────────────────────────────────────────
+        self.overlay.draw(s)
+        pygame.display.flip()
+
+    # ───────────────────────────────────────────────────────
     def run(self):
         running = True
-        prev_t  = time.perf_counter()
-
+        prev    = time.perf_counter()
         while running:
-            now = time.perf_counter()
-            dt  = now - prev_t
-            prev_t = now
+            now=time.perf_counter(); dt=now-prev; prev=now
 
             if self.hidden:
-                time.sleep(0.05)
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        running = False
-                continue
+                pygame.event.pump(); time.sleep(0.05); continue
 
-            # ── Events ───────────────────────────────────────
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
+            for e in pygame.event.get():
+                if e.type==pygame.QUIT: running=False
 
                 # window drag
-                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    mx, my = event.pos
-                    if my < 52 and mx < W - 30:
-                        self.dragging_window = True
-                        wx, wy = pygame.display.get_surface().get_abs_offset() if hasattr(pygame.display, 'get_surface') else (0,0)
+                if e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
+                    mx,my=e.pos
+                    if pygame.Rect(W-26,8,18,18).collidepoint(mx,my):
+                        running=False; break
+                    if my<50 and mx<W-30:
+                        self._drag_win=True
                         try:
-                            import ctypes
-                            cx, cy = ctypes.windll.user32.GetCursorPos.__func__() if False else (0,0)
-                        except:
-                            pass
-                        self.drag_offset = event.pos
+                            import ctypes as _c
+                            pt=_c.wintypes.POINT()
+                            _c.windll.user32.GetCursorPos(_c.byref(pt))
+                            self._drag_off=(pt.x,pt.y)
+                            r=_c.wintypes.RECT()
+                            _c.windll.user32.GetWindowRect(_hwnd(),_c.byref(r))
+                            self._win_pos=[r.left,r.top]
+                        except: pass
 
-                    # close button
-                    if mx >= W-28 and my <= 28:
-                        running = False
+                if e.type==pygame.MOUSEBUTTONUP   and e.button==1: self._drag_win=False
 
-                if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                    self.dragging_window = False
+                if e.type==pygame.MOUSEMOTION and self._drag_win:
+                    try:
+                        import ctypes as _c
+                        pt=_c.wintypes.POINT()
+                        _c.windll.user32.GetCursorPos(_c.byref(pt))
+                        dx=pt.x-self._drag_off[0]; dy=pt.y-self._drag_off[1]
+                        _c.windll.user32.MoveWindow(_hwnd(),
+                            self._win_pos[0]+dx, self._win_pos[1]+dy, W, H, True)
+                    except: pass
 
-                if event.type == pygame.MOUSEMOTION and self.dragging_window:
-                    pass  # window move handled below
+                if not self.overlay.active:
+                    self.panel_l.events(e)
+                    self.panel_r.events(e)
+                    self.btn_hide.event(e)
 
-                # sliders / checkboxes / buttons
-                if not self.bind_overlay.active:
-                    for sl in self.sliders:
-                        sl.handle_event(event)
-                    for cb in self.checkboxes:
-                        cb.handle_event(event)
-                    for btn in self.buttons:
-                        btn.handle_event(event)
+                if self.panel_l.btn.clicked and not self.overlay.active:
+                    self._waiting_bind=True
+                    self.overlay.open("left_click", lambda k: self._set_bind("left",k))
+                if self.panel_r.btn.clicked and not self.overlay.active:
+                    self._waiting_bind=True
+                    self.overlay.open("right_click", lambda k: self._set_bind("right",k))
+                if self.btn_hide.clicked and not self.overlay.active:
+                    self._waiting_bind=True
+                    self.overlay.open("hide", lambda k: self._set_bind("hide",k))
 
-                # button actions
-                if self.btn_bind_click.clicked:
-                    self.waiting_bind = "click"
-                    self.bind_overlay.open("click")
+            self.panel_l.update(dt)
+            self.panel_r.update(dt)
+            self.btn_hide.update(dt)
+            if self._status_t>0: self._status_t=max(0,self._status_t-dt)
 
-                if self.btn_bind_hide.clicked:
-                    self.waiting_bind = "hide"
-                    self.bind_overlay.open("hide")
-
-                if self.btn_load_sound.clicked:
-                    self._open_sound_dialog()
-
-            # ── Sync & Update ────────────────────────────────
-            self._sync()
-
-            for sl in self.sliders:  sl.update(dt)
-            for cb in self.checkboxes: cb.update(dt)
-            for btn in self.buttons:   btn.update(dt)
-
-            if self.status_timer > 0:
-                self.status_timer = max(0, self.status_timer - dt)
-
-            # ── Draw ─────────────────────────────────────────
-            self._draw_bg()
-            self._draw_header()
-            self._draw_cps_panel(dt)
-
-            self._draw_section("CPS Settings", 118)
-            for sl in self.sliders:
-                sl.draw(self.screen)
-
-            self._draw_section("Options", 248)
-            for cb in self.checkboxes:
-                cb.draw(self.screen)
-
-            self._draw_section("Binds", 330)
-            for btn in self.buttons:
-                btn.draw(self.screen)
-
-            self._draw_footer()
-            self._draw_status()
-            self.bind_overlay.draw(self.screen)
-
-            pygame.display.flip()
+            self._draw(dt)
             self.clock.tick(60)
 
         self.engine.stop()
-        self._key_listener.stop()
+        self._kb.stop()
+        self._ml.stop()
         pygame.quit()
         sys.exit()
 
-    def _open_sound_dialog(self):
-        """Open a file dialog to pick a .wav sound"""
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            path = filedialog.askopenfilename(
-                title="Select click sound",
-                filetypes=[("WAV Files", "*.wav"), ("All files", "*.*")]
-            )
-            root.destroy()
-            if path:
-                ok = self.engine.load_sound(path)
-                if ok:
-                    self.status_msg   = f"Sound loaded: {os.path.basename(path)}"
-                    self.status_timer = 2.5
-                    self.cb_sound.value = True
-                else:
-                    self.status_msg   = "Failed to load sound (WAV only)"
-                    self.status_timer = 2.5
-        except Exception as e:
-            self.status_msg   = "Tkinter unavailable for dialog"
-            self.status_timer = 2.5
-
-
-# ─────────────────────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    app = RadonApp()
-    app.run()
+if __name__=="__main__":
+    App().run()
